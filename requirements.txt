@@ -1,7 +1,16 @@
- langchain
-langchain-openai
+langchain
 langchain-community
+langchain-openai
+langchain-chroma
+langchain-text-splitters
+langchain-classic
+sentence-transformers
 chromadb
 pypdf
+python-docx
 streamlit
 python-dotenv
+fastapi
+uvicorn
+rank-bm25
+pydantic-settings
