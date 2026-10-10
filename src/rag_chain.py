@@ -1,7 +1,9 @@
+# RAG Chain - Final Version (tanpa filter, pakai hybrid retriever langsung)
+
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-from src.config import KNOWLEDGE_DIR
+from src.config import KNOWLEDGE_DIR, CHROMA_DIR
 from src.ingest.loaders import load_all_documents
 from src.ingest.chunker import chunk_documents
 from src.retrieval.hybrid import build_retriever
@@ -11,75 +13,50 @@ from src.generation.domain_gate import is_domain_question
 from src.citation import build_citations
 from src.fallback import extractive_fallback
 
-# ============================================
 # STATE
-# ============================================
 _retriever = None
-_chunks = None
-_sources = None
+_initialized = False
 
 
 def _format_docs(docs):
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def _ensure_retriever():
-    """Lazy build retriever (cached)."""
-    global _retriever, _chunks, _sources
-    if _retriever is None:
-        print("[rag_chain] Memuat dokumen & membangun retriever...")
-        docs = load_all_documents(KNOWLEDGE_DIR)
-        _chunks = chunk_documents(docs)
-        _retriever = build_retriever(_chunks)
-
-        # Cache daftar source yang ada di ChromaDB
-        from src.retrieval.vector_store import get_store
-        store = get_store()
-        results = store.get(limit=10000)
-        _sources = list(set(m.get("source", "") for m in results["metadatas"]))
-        print(f"[rag_chain] Retriever siap dengan {len(_chunks)} chunks.")
-        print(f"[rag_chain] Sumber tersedia: {_sources}")
-    return _retriever
-
-
-def _detect_filter(query: str):
-    """Deteksi dokumen mana yang harus difilter (auto-detect nama file)."""
-    if _sources is None:
-        return None
-
-    q_lower = query.lower()
-
-    # Kata kunci untuk SBP (PENGUMUMAN)
-    sbp_keywords = [
-        "sbp", "seleksi", "tamtama", "bintara", "pendaftaran",
-        "syarat administrasi", "persyaratan", "dokumen pendaftaran",
-        "jadwal seleksi", "tahapan seleksi", "panpus", "panda",
-        "pasfoto", "skhp", "sipk", "ijazah", "akreditasi",
-    ]
-    # Kata kunci untuk PERPOL (penilaian kinerja)
-    perpol_keywords = [
-        "penilaian kinerja", "sipk online", "litcatpers", "e-rohani",
-        "e-mental", "pka", "faktor spesifik", "faktor generik",
-        "kontrak kerja", "tugas lain", "penghargaan",
-    ]
-
-    # Cari file SBP
-    if any(kw in q_lower for kw in sbp_keywords):
-        for src in _sources:
-            if "PENGUMUMAN" in src.upper() and "SBP" in src.upper():
-                return {"source": src}
-
-    # Cari file PERPOL
-    if any(kw in q_lower for kw in perpol_keywords):
-        for src in _sources:
-            if "PERPOL" in src.upper():
-                return {"source": src}
-
-    return None
+def _auto_build_chroma():
+    from pathlib import Path
+    chroma_path = Path(CHROMA_DIR)
+    if chroma_path.exists() and any(chroma_path.iterdir()):
+        return
+    print("[rag_chain] Auto-build ChromaDB...")
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_chroma import Chroma
+    from src.config import EMBEDDING_MODEL
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    Chroma.from_documents(
+        _chunks, embeddings,
+        persist_directory=str(chroma_path),
+        collection_name="rag_polri",
+    )
+    print("[rag_chain] ChromaDB siap.")
 
 
-def ask(query: str) -> dict:
-    """Endpoint utama: tanya ke RAG, dapatkan jawaban + citations."""
+def _ensure_initialized():
+    global _retriever, _initialized, _chunks
+    if _initialized:
+        return
+    print("[rag_chain] Init...")
+    docs = load_all_documents(KNOWLEDGE_DIR)
+    if not docs:
+        raise RuntimeError("Tidak ada dokumen di knowledge dir")
+    _chunks = chunk_documents(docs)
+    print(f"[rag_chain] Total chunks: {len(_chunks)}")
+    _auto_build_chroma()
+    _retriever = build_retriever(_chunks)
+    print("[rag_chain] Retriever siap.")
+    _initialized = True
+
+
+def ask(query):
     # 1. Domain gate
     if not is_domain_question(query):
         return {
@@ -89,20 +66,13 @@ def ask(query: str) -> dict:
             "confidence": 0.0,
         }
 
-    # 2. Retrieval dengan filter otomatis
-    retriever = _ensure_retriever()
-    filter_meta = _detect_filter(query)
-    print(f"[rag_chain] Filter: {filter_meta}")
+    # 2. Init
+    _ensure_initialized()
 
-    if filter_meta:
-        from src.retrieval.vector_store import get_store
-        store = get_store()
-        filtered_retriever = store.as_retriever(
-            search_kwargs={"k": 10, "filter": filter_meta}
-        )
-        docs = filtered_retriever.invoke(query)
-    else:
-        docs = retriever.invoke(query)
+    # 3. Retrieval (langsung pakai hybrid retriever, tanpa filter)
+    print(f"[rag_chain] Query: {query[:60]}...")
+    docs = _retriever.invoke(query)
+    print(f"[rag_chain] Retrieved {len(docs)} docs")
 
     if not docs:
         return {
@@ -112,13 +82,15 @@ def ask(query: str) -> dict:
             "confidence": 0.0,
         }
 
-    # 3. Generation
+    # 4. Generation
     try:
         llm = get_llm()
         prompt = get_rag_prompt()
-
         chain = (
-            {"context": lambda x: _format_docs(docs), "input": RunnablePassthrough()}
+            {
+                "context": lambda x: _format_docs(docs),
+                "input": RunnablePassthrough(),
+            }
             | prompt
             | llm
             | StrOutputParser()
@@ -130,7 +102,7 @@ def ask(query: str) -> dict:
         answer = extractive_fallback(query, docs)
         provider = "fallback"
 
-    # 4. Citations
+    # 5. Citations
     citations = build_citations(docs)
 
     return {
