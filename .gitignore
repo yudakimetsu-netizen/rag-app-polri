@@ -21,3 +21,6 @@ chroma_db/
 # OS
 .DS_Store
 Thumbs.db
+
+# Kecualikan template .env (boleh di-push)
+!.env.example
