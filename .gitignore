@@ -24,3 +24,6 @@ Thumbs.db
 
 # Kecualikan template .env (boleh di-push)
 !.env.example
+
+# Runtime files
+public_url.txt
